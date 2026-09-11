@@ -16,13 +16,22 @@ function Test-Asset([string]$Path, [string]$Hash) {
     if ($Hash) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -eq $Hash }
     # Tokens are fetched from the same pinned revision, never from a moving 'main'.
     $id = 0
-    foreach ($line in [IO.File]::ReadLines($Path)) {
-        $split = $line.LastIndexOf(' ')
-        $number = 0
-        if ($split -le 0 -or -not [int]::TryParse($line.Substring($split + 1), [ref]$number) -or $number -ne $id) { return $false }
-        try { [void][Convert]::FromBase64String($line.Substring(0, $split)) } catch { return $false }
-        $id++
-    }
+    # Explicit disposal also covers early validation failures in Windows PowerShell.
+    $reader = [IO.File]::OpenText($Path)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $split = $line.LastIndexOf(' ')
+            $number = 0
+            if ($split -le 0 -or -not [int]::TryParse($line.Substring($split + 1), [ref]$number) -or $number -ne $id) { return $false }
+            $token = $line.Substring(0, $split)
+            if ($id -eq 50256) {
+                if ($token -ne '=') { return $false }
+            } else {
+                try { [void][Convert]::FromBase64String($token) } catch { return $false }
+            }
+            $id++
+        }
+    } finally { $reader.Dispose() }
     return $id -eq 50257
 }
 $mutex = New-Object Threading.Mutex -ArgumentList $false, 'Local\pub-transcribe-model-setup'
@@ -55,6 +64,7 @@ try {
                         break
                     } catch {
                         if ($attempt -eq 3) { throw }
+                        Write-Warning $_.Exception.Message
                         Start-Sleep -Seconds 2
                     } finally { $client.Dispose() }
                 }
@@ -62,7 +72,12 @@ try {
                 if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temp, $path, $null) }
                 else { [IO.File]::Move($temp, $path) }
                 Write-Host ('Installed: ' + $path)
-            } finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
+            } finally {
+                if (Test-Path -LiteralPath $temp) {
+                    try { Remove-Item -LiteralPath $temp -Force }
+                    catch { Write-Warning ('Could not remove temporary download: ' + $_.Exception.Message) }
+                }
+            }
         }
     }
     Write-Host 'MODEL_SETUP_OK - Recognition runs locally; no audio is sent to the download provider.'

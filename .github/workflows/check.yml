@@ -10,12 +10,18 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Verify repository file checksums
+        shell: powershell
+        run: .\test\checksums.ps1
       - name: PowerShell syntax, structure and WPF smoke
         shell: powershell
         run: .\test\check.ps1 -Runtime
       - name: Engine regression tests (no microphone or Whisper downloads)
         shell: powershell
         run: .\test\engine.ps1
+      - name: Token sentinel and file-handle regression tests
+        shell: powershell
+        run: .\test\token-validation.ps1
       - name: Native DLL and Silero VAD smoke
         shell: powershell
         run: .\test\native-vad.ps1

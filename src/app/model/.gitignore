@@ -1,2 +1,5 @@
 /encoder-epoch-99-avg-1.int8.onnx
 /encoder-epoch-99-avg-1.int8.onnx.tmp.*
+/whisper-small/
+/whisper-large-v3-turbo/
+*.download.*

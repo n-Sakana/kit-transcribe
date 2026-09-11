@@ -179,14 +179,27 @@ public sealed class WhisperSpeechDecoder : ISpeechDecoder
     {
         if (!File.Exists(path)) throw new FileNotFoundException("Token file missing. Run setup-models.cmd: " + path, path);
         int expectedId = 0;
-        foreach (string line in File.ReadLines(path))
+        using (var reader = File.OpenText(path))
         {
-            int split = line.LastIndexOf(' ');
-            int id;
-            if (split <= 0 || !int.TryParse(line.Substring(split + 1), out id) || id != expectedId++)
-                throw new InvalidDataException("Invalid Whisper token table: " + path);
-            try { Convert.FromBase64String(line.Substring(0, split)); }
-            catch (FormatException) { throw new InvalidDataException("Invalid Whisper token encoding: " + path); }
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                int split = line.LastIndexOf(' ');
+                int id;
+                if (split <= 0 || !int.TryParse(line.Substring(split + 1), out id) || id != expectedId++)
+                    throw new InvalidDataException("Invalid Whisper token table: " + path);
+                string token = line.Substring(0, split);
+                // sherpa's token table uses '=' for the final empty token, not strict Base64.
+                if (id == 50256)
+                {
+                    if (token != "=") throw new InvalidDataException("Invalid Whisper empty-token marker: " + path);
+                }
+                else
+                {
+                    try { Convert.FromBase64String(token); }
+                    catch (FormatException) { throw new InvalidDataException("Invalid Whisper token encoding: " + path); }
+                }
+            }
         }
         if (expectedId != 50257) throw new InvalidDataException("Unexpected Whisper token count: " + path);
     }
