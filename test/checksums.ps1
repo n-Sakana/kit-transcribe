@@ -1,6 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $count = 0
+$mismatches = New-Object System.Collections.Generic.List[string]
 foreach ($line in [IO.File]::ReadAllLines((Join-Path $root 'SHA256SUMS.txt'))) {
     if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw ('Invalid checksum line: ' + $line) }
     $expected = $matches[1]; $path = $matches[2]
@@ -22,8 +23,12 @@ foreach ($line in [IO.File]::ReadAllLines((Join-Path $root 'SHA256SUMS.txt'))) {
         $errorText = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
         if ($process.ExitCode -ne 0) { throw ('git cat-file failed: ' + $errorText) }
-        if ($actual -ne $expected) { throw ('Checksum mismatch: ' + $path + ' expected ' + $expected + ' actual ' + $actual) }
+        if ($actual -ne $expected) {
+            $mismatches.Add($path)
+            Write-Output ('CHECKSUM_MISMATCH ' + $actual + '  ' + $path)
+        }
         $count++
     } finally { $sha.Dispose(); $process.Dispose() }
 }
+if ($mismatches.Count -gt 0) { throw ('Checksum mismatches: ' + ($mismatches -join ', ')) }
 Write-Output ('CHECKSUMS_OK ' + $count)

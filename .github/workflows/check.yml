@@ -10,9 +10,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Verify repository file checksums
-        shell: powershell
-        run: .\test\checksums.ps1
       - name: PowerShell syntax, structure and WPF smoke
         shell: powershell
         run: .\test\check.ps1 -Runtime
@@ -25,3 +22,6 @@ jobs:
       - name: Native DLL and Silero VAD smoke
         shell: powershell
         run: .\test\native-vad.ps1
+      - name: Verify repository file checksums
+        shell: powershell
+        run: .\test\checksums.ps1
