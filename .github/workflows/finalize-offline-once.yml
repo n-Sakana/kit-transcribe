@@ -46,8 +46,13 @@ jobs:
           source = source.replace('Whisper small を検証・読み込み中', 'Whisper small の同梱モデルを準備・検証・読み込み中')
           source = source.replace('Whisper large-v3-turbo を検証・読み込み中', 'Whisper large-v3-turbo の同梱モデルを準備・検証・読み込み中')
           path.write_bytes(source.encode('utf-8-sig'))
+          path = pathlib.Path('test/bundle-tests.cs')
+          source = path.read_text(encoding='utf-8-sig')
+          source = replace_once(source, 'catch (IOException) { rejected = true; }', 'catch (InvalidDataException) { rejected = true; }\n        catch (IOException) { rejected = true; }')
+          path.write_bytes(source.encode('utf-8'))
           for name in ['engine.cs', 'bootstrap.ps1', 'main.ps1']:
               subprocess.run(['git', 'add', '--', (app / name).as_posix()], check=True)
+          subprocess.run(['git', 'add', '--', 'test/bundle-tests.cs'], check=True)
           print('OFFLINE_INTEGRATION_OK')
           print('TOKEN_SHA256 small', small_hash)
           print('TOKEN_SHA256 turbo', turbo_hash)
