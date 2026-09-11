@@ -1,249 +1,214 @@
-﻿# transcribe -- local Japanese real-time transcription GUI.
-param(
-    [string]$Target = "",
-    [switch]$Smoke
-)
-$ErrorActionPreference = "Stop"
-$script:SmokeMode = $Smoke.IsPresent
-$script:windowTitle = "文字起こし"
+﻿# Windows PowerShell 5.1 / WPF. All capture and inference work runs on a C# worker.
+param([string]$Target = '', [switch]$Smoke)
+$ErrorActionPreference = 'Stop'
+$script:closing = $false
+$script:allowClose = $false
+$script:seenSession = 0
+$script:previousState = ''
+$script:logPath = ''
+$script:refinementCompleted = $false
 
-function Show-FatalError {
-    param([string]$Message)
-    if ($script:SmokeMode -or $env:TRANSCRIBE_NOPAUSE -eq "1") {
-        [Console]::Error.WriteLine($Message)
-        exit 1
-    }
+function Write-TranscribeLog([string]$Message) {
     try {
-        Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
-        [void][System.Windows.MessageBox]::Show(
-            $Message,
-            $script:windowTitle,
-            [System.Windows.MessageBoxButton]::OK,
-            [System.Windows.MessageBoxImage]::Error
-        )
-    } catch {
-    }
-    exit 1
+        $base = [Environment]::GetFolderPath('LocalApplicationData')
+        if (-not $base) { $base = [IO.Path]::GetTempPath() }
+        $directory = Join-Path $base 'pub-transcribe\logs'
+        [void][IO.Directory]::CreateDirectory($directory)
+        $script:logPath = Join-Path $directory ('transcribe_' + (Get-Date -Format 'yyyyMMdd') + '.log')
+        Add-Content -LiteralPath $script:logPath -Encoding UTF8 -Value ((Get-Date -Format o) + "`r`n" + $Message)
+    } catch { [Console]::Error.WriteLine($Message) }
 }
-
-function Show-UiError {
-    param([string]$Message)
-    [void][System.Windows.MessageBox]::Show(
-        $Message,
-        $script:windowTitle,
-        [System.Windows.MessageBoxButton]::OK,
-        [System.Windows.MessageBoxImage]::Error
-    )
+function Show-UiError([string]$Message) {
+    Write-TranscribeLog $Message
+    $script:refinementCompleted = $false
+    $errorText.Text = "エラー: $Message`r`nログ: $script:logPath"
+    $errorText.Visibility = 'Visible'
 }
-
-function Get-UniqueOutputPath {
-    param([string]$Directory)
-    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Force -Path $Directory)
-    }
-    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $candidate = Join-Path $Directory ("transcribe_" + $stamp + ".txt")
-    $suffix = 1
-    while (Test-Path -LiteralPath $candidate) {
-        $candidate = Join-Path $Directory ("transcribe_" + $stamp + "_" + $suffix + ".txt")
-        $suffix++
-    }
-    return $candidate
+function Get-SelectedTextBox {
+    if ($tabs.SelectedIndex -eq 1) { return $cleanTranscript }
+    return $transcript
+}
+function Get-UniqueOutputPath([string]$Directory) {
+    [void][IO.Directory]::CreateDirectory($Directory)
+    return Join-Path $Directory ('transcribe_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [Guid]::NewGuid().ToString('N') + '.txt')
 }
 
 try {
-    $bin = Join-Path $PSScriptRoot "bin"
-    $model = Join-Path $PSScriptRoot "model"
-    $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-    $outputDir = Join-Path $root "output"
-    $env:PATH = $bin + ";" + $env:PATH
-
-    Add-Type -Path (Join-Path $bin "sherpa-onnx.dll")
-    Add-Type -Path (Join-Path $bin "NAudio.dll")
-    $engineReferences = @(
-        (Join-Path $bin "sherpa-onnx.dll"),
-        (Join-Path $bin "NAudio.dll")
-    )
-    $engineSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "engine.cs"))
-    Add-Type -TypeDefinition $engineSource -ReferencedAssemblies $engineReferences
+    . (Join-Path $PSScriptRoot 'bootstrap.ps1')
+    Initialize-TranscribeEngine
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-
-    $xaml = @"
+    $root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+    $outputDir = Join-Path $root 'output'
+    $model = Join-Path $PSScriptRoot 'model'
+    $engine = New-Object TranscriberEngine -ArgumentList $model, (Join-Path $outputDir 'recordings')
+    $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="文字起こし" Width="720" Height="540"
-        MinWidth="660" MinHeight="400" WindowStartupLocation="CenterScreen">
-  <Grid Margin="12">
+        Title="文字起こし — Whisper" Width="850" Height="620"
+        MinWidth="740" MinHeight="460" WindowStartupLocation="CenterScreen">
+  <Grid Margin="14">
     <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="*"/>
-      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
-    <StackPanel Grid.Row="0" Orientation="Horizontal">
-      <Button x:Name="StartButton" Content="開始" Width="88" Height="32"/>
-      <Button x:Name="CopyButton" Content="コピー" Width="78" Height="32" Margin="8,0,0,0"/>
-      <Button x:Name="ClearButton" Content="クリア" Width="78" Height="32" Margin="8,0,0,0"/>
-      <Button x:Name="SaveButton" Content="保存" Width="78" Height="32" Margin="8,0,0,0"/>
-      <TextBlock Text="感度" VerticalAlignment="Center" Margin="16,0,5,0"/>
-      <Slider x:Name="GainSlider" Minimum="0.5" Maximum="4" Value="1"
-              TickFrequency="0.5" Width="130" VerticalAlignment="Center"/>
-      <ProgressBar x:Name="LevelBar" Minimum="0" Maximum="1" Width="100" Height="15"
-                   Margin="10,0,0,0" VerticalAlignment="Center"/>
+    <WrapPanel Grid.Row="0">
+      <Button x:Name="StartButton" Content="録音開始" MinWidth="100" Height="34" Margin="0,0,8,4"/>
+      <Button x:Name="RefineButton" Content="清書を実行" MinWidth="110" Height="34" Margin="0,0,8,4" IsEnabled="False"/>
+      <Button x:Name="CancelButton" Content="処理を中止" Width="100" Height="34" Margin="0,0,16,4" IsEnabled="False"/>
+      <Button x:Name="CopyButton" Content="コピー" Width="72" Height="34" Margin="0,0,8,4"/>
+      <Button x:Name="ClearButton" Content="クリア" Width="72" Height="34" Margin="0,0,8,4"/>
+      <Button x:Name="SaveButton" Content="保存" Width="72" Height="34" Margin="0,0,8,4"/>
+    </WrapPanel>
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,6,0,10">
+      <TextBlock Text="マイク感度" VerticalAlignment="Center"/>
+      <Slider x:Name="GainSlider" Minimum="0.5" Maximum="4" Value="1" Width="160" Margin="10,0,16,0"/>
+      <ProgressBar x:Name="LevelBar" Minimum="0" Maximum="1" Width="130" Height="14"/>
+      <TextBlock Text="リアルタイム: small / 清書: large-v3-turbo" Margin="16,0,0,0" VerticalAlignment="Center" Foreground="DimGray"/>
     </StackPanel>
-    <TextBox x:Name="Transcript" Grid.Row="1" Margin="0,12,0,8"
-             AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True"
-             VerticalScrollBarVisibility="Auto" FontSize="16"/>
-    <TextBlock x:Name="StatusText" Grid.Row="2" Text="準備完了" Foreground="DimGray"
-               TextTrimming="CharacterEllipsis"/>
+    <TabControl x:Name="Tabs" Grid.Row="2">
+      <TabItem Header="リアルタイム">
+        <TextBox x:Name="Transcript" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True"
+                 VerticalScrollBarVisibility="Auto" FontSize="16" BorderThickness="0" Padding="8"/>
+      </TabItem>
+      <TabItem Header="清書">
+        <TextBox x:Name="CleanTranscript" AcceptsReturn="True" TextWrapping="Wrap" IsReadOnly="True"
+                 VerticalScrollBarVisibility="Auto" FontSize="16" BorderThickness="0" Padding="8"/>
+      </TabItem>
+    </TabControl>
+    <TextBlock x:Name="ErrorText" Grid.Row="3" Foreground="Firebrick" TextWrapping="Wrap" MaxHeight="100" Margin="0,8,0,0" Visibility="Collapsed"/>
+    <TextBlock x:Name="StatusText" Grid.Row="4" Text="準備完了。モデルは同梱済みです。初回は録音開始時にローカルで準備します。" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    <TextBlock Grid.Row="5" Text="音声は output/recordings にローカル保存します。清書は録音停止後に手動実行します。"
+               FontSize="12" Foreground="DimGray" Margin="0,6,0,0" TextWrapping="Wrap"/>
   </Grid>
 </Window>
-"@
-
+'@
     $window = [System.Windows.Markup.XamlReader]::Parse($xaml)
-    $startButton = $window.FindName("StartButton")
-    $copyButton = $window.FindName("CopyButton")
-    $clearButton = $window.FindName("ClearButton")
-    $saveButton = $window.FindName("SaveButton")
-    $gainSlider = $window.FindName("GainSlider")
-    $levelBar = $window.FindName("LevelBar")
-    $transcript = $window.FindName("Transcript")
-    $statusText = $window.FindName("StatusText")
-
-    $engine = New-Object TranscriberEngine -ArgumentList $model
-    $engine.Gain = [single]$gainSlider.Value
-    $script:uiRunning = $false
-    $script:stopping = $false
-    $script:closeError = $null
+    $startButton = $window.FindName('StartButton'); $refineButton = $window.FindName('RefineButton')
+    $cancelButton = $window.FindName('CancelButton'); $copyButton = $window.FindName('CopyButton')
+    $clearButton = $window.FindName('ClearButton'); $saveButton = $window.FindName('SaveButton')
+    $gainSlider = $window.FindName('GainSlider'); $levelBar = $window.FindName('LevelBar')
+    $transcript = $window.FindName('Transcript'); $cleanTranscript = $window.FindName('CleanTranscript')
+    $tabs = $window.FindName('Tabs'); $statusText = $window.FindName('StatusText'); $errorText = $window.FindName('ErrorText')
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(100)
     $timer.Add_Tick({
-        [string]$nextText = ""
-        while ($engine.TryGetText([ref]$nextText)) {
-            $transcript.AppendText($nextText + "`r`n")
-            $transcript.ScrollToEnd()
-            $nextText = ""
-        }
-
-        $errors = New-Object System.Collections.Generic.List[string]
-        [string]$nextError = ""
-        while ($engine.TryGetError([ref]$nextError)) {
-            $errors.Add($nextError)
-            $nextError = ""
-        }
-        if ($errors.Count -gt 0) {
-            $message = $errors -join "`r`n"
-            $statusText.Text = "エラー: " + $message
-            Show-UiError $message
-        }
-
-        $levelBar.Value = [double]$engine.LatestLevel
-        if ($script:uiRunning -and -not $engine.IsRunning) {
-            $script:uiRunning = $false
-            $script:stopping = $false
-            $startButton.IsEnabled = $true
-            $startButton.Content = "開始"
-            $statusText.Text = "停止しました"
-        }
-    })
-
-    $startButton.Add_Click({
-        if (-not $script:uiRunning) {
-            try {
-                $engine.Gain = [single]$gainSlider.Value
-                $engine.Start()
-                $script:uiRunning = $true
-                $script:stopping = $false
-                $startButton.Content = "停止"
-                $statusText.Text = "録音中"
-            } catch {
-                Show-UiError $_.Exception.Message
-                $statusText.Text = "開始できませんでした"
-            }
-            return
-        }
-        if (-not $script:stopping) {
-            try {
-                $script:stopping = $true
-                $startButton.IsEnabled = $false
-                $startButton.Content = "停止中..."
-                $statusText.Text = "最後の発話を処理しています"
-                $engine.Stop()
-            } catch {
-                $script:stopping = $false
-                $startButton.IsEnabled = $true
-                Show-UiError $_.Exception.Message
-            }
-        }
-    })
-
-    $gainSlider.Add_ValueChanged({
-        if ($null -ne $engine) {
-            $engine.Gain = [single]$gainSlider.Value
-        }
-    })
-
-    $copyButton.Add_Click({
         try {
-            if ([string]::IsNullOrWhiteSpace($transcript.Text)) {
-                $statusText.Text = "コピーする文字がありません"
+            if ($engine.SessionVersion -ne $script:seenSession) {
+                $script:seenSession = $engine.SessionVersion
+                $transcript.Clear(); $cleanTranscript.Clear(); $tabs.SelectedIndex = 0
+            }
+            [string]$text = ''
+            while ($engine.TryGetText([ref]$text)) { $transcript.AppendText($text + "`r`n"); $text = '' }
+            $transcript.ScrollToEnd()
+            while ($engine.TryGetRefinedText([ref]$text)) {
+                $cleanTranscript.Text = $text; $tabs.SelectedIndex = 1; $script:refinementCompleted = $true
+                $statusText.Text = '清書が完了しました'; $text = ''
+            }
+            while ($engine.TryGetError([ref]$text)) { Show-UiError $text; $text = '' }
+            $busy = $engine.IsBusy; $state = $engine.State
+            $startButton.IsEnabled = (-not $script:closing) -and ((-not $busy) -or $state -eq 'Recording' -or $state -eq 'LoadingSmall')
+            $startButton.Content = if ($busy -and $state -in @('LoadingSmall', 'Recording', 'Stopping')) { '録音停止' } else { '録音開始' }
+            $refineButton.IsEnabled = (-not $script:closing) -and (-not $busy) -and $engine.HasRecording
+            $cancelButton.IsEnabled = $busy -and (-not $script:closing) -and (-not $engine.IsCancellationRequested)
+            $clearButton.IsEnabled = (-not $busy) -and (-not $script:closing)
+            $gainSlider.IsEnabled = (-not $script:closing) -and $state -notin @('LoadingTurbo', 'Refining')
+            $levelBar.Value = [double]$engine.LatestLevel
+            if ($script:closing) {
+                $statusText.Text = '終了処理中。現在のモデル処理が終わるまで音声を保持します。'
+                if (-not $busy) { $engine.Dispose(); $script:allowClose = $true; $timer.Stop(); $window.Close() }
                 return
             }
-            Set-Clipboard -Value $transcript.Text
-            $statusText.Text = "クリップボードへコピーしました"
-        } catch {
-            Show-UiError ("コピーに失敗しました: " + $_.Exception.Message)
-        }
+            switch ($state) {
+                'LoadingSmall' { $statusText.Text = 'Whisper small の同梱モデルを準備・検証・読み込み中（まだ録音していません）...' }
+                'Recording' { $statusText.Text = '録音中 — 未処理音声: {0:N1} 秒' -f $engine.BacklogSeconds }
+                'Stopping' { $statusText.Text = '録音停止処理中 — 残りの音声を処理しています。中止しても録音は残ります。' }
+                'LoadingTurbo' { $statusText.Text = 'Whisper large-v3-turbo の同梱モデルを準備・検証・読み込み中...' }
+                'Refining' { $statusText.Text = '清書中: {0:P0}（中止は現在の音声区間の処理後に反映）' -f $engine.Progress }
+                'Error' { $statusText.Text = '処理に失敗しました。エラー欄とログを確認してください。保存済み音声は保持しています。' }
+                'Idle' {
+                    if ($script:previousState -ne 'Idle' -and $script:previousState -ne '') {
+                        $statusText.Text = if ($script:refinementCompleted) { '清書が完了しました。リアルタイム結果は別タブに保持しています。' } elseif ($engine.HasRecording) { '停止しました。清書を実行できます。音声: ' + $engine.LastRecordingPath } else { '準備完了' }
+                    }
+                }
+            }
+            $script:previousState = $state
+        } catch { Show-UiError $_.Exception.ToString() }
     })
-
+    $startButton.Add_Click({
+        try {
+            if ($engine.IsBusy) { $engine.Stop(); $startButton.IsEnabled = $false; return }
+            if ($transcript.Text -or $cleanTranscript.Text) {
+                $answer = [System.Windows.MessageBox]::Show('新しい録音では表示をクリアします。必要な文字起こしは保存済みですか？ 音声ファイルは削除しません。', '新しい録音', 'YesNo', 'Question')
+                if ($answer -ne 'Yes') { return }
+            }
+            $engine.Gain = [single]$gainSlider.Value
+            $engine.Start()
+            $errorText.Visibility = 'Collapsed'; $script:refinementCompleted = $false
+            $refineButton.IsEnabled = $false; $clearButton.IsEnabled = $false
+        } catch { Show-UiError $_.Exception.ToString() }
+    })
+    $refineButton.Add_Click({
+        try {
+            $engine.StartRefinement()
+            $errorText.Visibility = 'Collapsed'; $script:refinementCompleted = $false
+            $refineButton.IsEnabled = $false; $startButton.IsEnabled = $false; $clearButton.IsEnabled = $false
+        } catch { Show-UiError $_.Exception.ToString() }
+    })
+    $cancelButton.Add_Click({
+        try { $engine.Cancel(); $cancelButton.IsEnabled = $false; $statusText.Text = '処理の中止を要求しました。録音と既存の結果は残ります。' }
+        catch { Show-UiError $_.Exception.ToString() }
+    })
+    $gainSlider.Add_ValueChanged({ try { $engine.Gain = [single]$gainSlider.Value } catch { Show-UiError $_.Exception.ToString() } })
+    $copyButton.Add_Click({
+        try { $box = Get-SelectedTextBox; if ($box.Text) { Set-Clipboard -Value $box.Text; $statusText.Text = '表示中のタブをコピーしました' } }
+        catch { Show-UiError $_.Exception.ToString() }
+    })
     $clearButton.Add_Click({
-        $transcript.Clear()
-        $statusText.Text = "クリアしました"
+        if (-not $engine.IsBusy) { (Get-SelectedTextBox).Clear(); $statusText.Text = '表示中のタブをクリアしました（録音は保持）' }
     })
-
     $saveButton.Add_Click({
         try {
-            if ([string]::IsNullOrWhiteSpace($transcript.Text)) {
-                $statusText.Text = "保存する文字がありません"
+            $box = Get-SelectedTextBox
+            if (-not $box.Text) { $statusText.Text = '保存する文字がありません'; return }
+            $path = Get-UniqueOutputPath $outputDir
+            [IO.File]::WriteAllText($path, $box.Text, (New-Object System.Text.UTF8Encoding -ArgumentList $true))
+            $statusText.Text = '保存しました: ' + $path
+        } catch { Show-UiError $_.Exception.ToString() }
+    })
+    $window.Add_Closing({
+        param($sender, $eventArgs)
+        if ($script:allowClose) { return }
+        try {
+            if ($engine.IsBusy) {
+                $eventArgs.Cancel = $true
+                $script:closing = $true
+                $engine.Cancel()
                 return
             }
-            $path = Get-UniqueOutputPath $outputDir
-            $utf8Bom = New-Object System.Text.UTF8Encoding -ArgumentList $true
-            [IO.File]::WriteAllText($path, $transcript.Text, $utf8Bom)
-            $statusText.Text = "保存しました: " + $path
-        } catch {
-            Show-UiError ("保存に失敗しました: " + $_.Exception.Message)
-        }
+            $engine.Dispose(); $timer.Stop()
+        } catch { $eventArgs.Cancel = $true; Show-UiError $_.Exception.ToString() }
     })
-
-    $window.Add_Closing({
-        $timer.Stop()
-        try {
-            $engine.Dispose()
-        } catch {
-            $script:closeError = $_.Exception.Message
-        }
-    })
-
     if ($Smoke) {
-        $transcript.Text = "smoke"
+        if ($refineButton.IsEnabled) { throw 'Refinement must be disabled without a recording.' }
+        if ($engine.IsBusy) { throw 'Opening the UI must not load models or start recording.' }
+        $transcript.Text = 'smoke'
         $clearButton.RaiseEvent((New-Object System.Windows.RoutedEventArgs -ArgumentList ([System.Windows.Controls.Button]::ClickEvent)))
-        if ($transcript.Text -ne "") {
-            throw "Clear button did not empty the transcript."
-        }
-        Write-Output "CLEAR_OK"
-        $timer.Start()
-        $timer.Stop()
+        if ($transcript.Text -ne '') { throw 'Clear did not empty the active transcript.' }
         $engine.Dispose()
-        Write-Output "SMOKE_OK"
+        Write-Output 'CLEAR_OK'; Write-Output 'SMOKE_OK'
         exit 0
     }
-
     $timer.Start()
     [void]$window.ShowDialog()
-    if ($null -ne $script:closeError) {
-        throw $script:closeError
-    }
 } catch {
-    Show-FatalError ("文字起こしを開始できませんでした。`r`n" + $_.Exception.Message)
+    $message = "文字起こしを開始できませんでした。`r`n" + $_.Exception.ToString()
+    Write-TranscribeLog $message
+    if ($Smoke -or $env:TRANSCRIBE_NOPAUSE -eq '1') { [Console]::Error.WriteLine($message); exit 1 }
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        [void][System.Windows.MessageBox]::Show($message + "`r`nログ: $script:logPath", '文字起こし', 'OK', 'Error')
+    } catch { [Console]::Error.WriteLine($message) }
+    exit 1
 }

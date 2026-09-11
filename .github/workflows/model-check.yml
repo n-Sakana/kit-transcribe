@@ -1,0 +1,15 @@
+name: Offline Whisper model smoke
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  models:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Reconstruct bundled models and infer with outbound application traffic blocked
+        shell: powershell
+        run: .\test\run-offline-ci.ps1
