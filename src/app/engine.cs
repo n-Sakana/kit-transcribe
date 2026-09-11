@@ -2,720 +2,631 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using NAudio.Wave;
 using SherpaOnnx;
 
-public sealed class TranscriberEngine : IDisposable
+// A session owns its native model and VAD. Tests inject a decoder without loading models.
+public interface ISpeechDecoder : IDisposable
 {
-    private const int SampleRate = 16000;
-    private const int PreRollSamples = SampleRate / 4;
-    private const int HistoryKeepSamples = SampleRate * 35;
-    private const int HistoryTrimAtSamples = SampleRate * 40;
-    private const string EncoderName = "encoder-epoch-99-avg-1.int8.onnx";
-    private const string EncoderHash = "2C7BD08A8A99F9DDD0D9E458456577B1F6279214E51426F114F9ECED44C54E1D";
-    private const long EncoderLength = 154670139L;
-    private static readonly string[] EncoderParts =
-    {
-        "encoder-epoch-99-avg-1.int8.onnx.part01",
-        "encoder-epoch-99-avg-1.int8.onnx.part02"
-    };
-    private static readonly string[] EncoderPartHashes =
-    {
-        "48895C41020DA39B020128252B9053152E0C5BB6CA555C49DFD5756811223517",
-        "9B06F691E3505A5EE5760E57EB559E40A5C95CCF9FB08881717DD5EB74EC4F87"
-    };
+    List<string> Feed(float[] samples);
+    List<string> Flush();
+}
 
+public sealed class WhisperSpeechDecoder : ISpeechDecoder
+{
     private OfflineRecognizer recognizer;
     private VoiceActivityDetector vad;
-    private readonly List<float> sampleHistory = new List<float>();
-    private readonly object stateLock = new object();
-    private readonly ConcurrentQueue<string> textQueue = new ConcurrentQueue<string>();
-    private readonly ConcurrentQueue<string> errorQueue = new ConcurrentQueue<string>();
-    private readonly ManualResetEvent captureStoppedEvent = new ManualResetEvent(true);
+    private readonly List<float> history = new List<float>();
     private int historyStart;
-    private float gain = 1.0f;
-    private float latestLevel;
-    private bool running;
-    private bool stopRequested;
-    private bool microphoneSession;
-    private BlockingCollection<float[]> audioQueue;
-    private Thread workerThread;
-    private WaveInEvent waveIn;
-    private bool disposed;
 
-    public float Gain
+    public static OfflineRecognizerConfig CreateConfig(string modelDirectory, bool refinement)
     {
-        get
-        {
-            lock (stateLock) return gain;
-        }
-        set
-        {
-            float next = value;
-            if (next < 0.5f) next = 0.5f;
-            if (next > 4.0f) next = 4.0f;
-            lock (stateLock) gain = next;
-        }
-    }
-
-    public float LatestLevel
-    {
-        get
-        {
-            lock (stateLock) return latestLevel;
-        }
-    }
-
-    public bool IsRunning
-    {
-        get
-        {
-            lock (stateLock) return running;
-        }
-    }
-
-    public TranscriberEngine(string modelDir)
-    {
-        if (string.IsNullOrWhiteSpace(modelDir))
-            throw new ArgumentException("Model directory is required.", "modelDir");
-
-        string encoder = EnsureModel(modelDir);
-        string decoder = RequireFile(modelDir, "decoder-epoch-99-avg-1.int8.onnx");
-        string joiner = RequireFile(modelDir, "joiner-epoch-99-avg-1.int8.onnx");
-        string tokens = RequireFile(modelDir, "tokens.txt");
-        string silero = RequireFile(modelDir, "silero_vad.onnx");
-
+        string name = refinement ? "turbo" : "small";
+        string directory = Path.Combine(modelDirectory, refinement ? "whisper-large-v3-turbo" : "whisper-small");
+        // Explicitly set nested struct defaults: Windows PowerShell uses the C# 5 compiler.
         var config = new OfflineRecognizerConfig();
-        config.FeatConfig.SampleRate = SampleRate;
-        config.FeatConfig.FeatureDim = 80;
-        config.ModelConfig.Transducer.Encoder = encoder;
-        config.ModelConfig.Transducer.Decoder = decoder;
-        config.ModelConfig.Transducer.Joiner = joiner;
-        config.ModelConfig.Tokens = tokens;
-        config.ModelConfig.NumThreads = 4;
+        config.FeatConfig.SampleRate = 16000;
+        config.FeatConfig.FeatureDim = refinement ? 128 : 80;
+        config.ModelConfig.Whisper.Encoder = Path.Combine(directory, name + "-encoder.int8.onnx");
+        config.ModelConfig.Whisper.Decoder = Path.Combine(directory, name + "-decoder.int8.onnx");
+        config.ModelConfig.Whisper.Language = "ja";
+        config.ModelConfig.Whisper.Task = "transcribe";
+        config.ModelConfig.Whisper.TailPaddings = 300;
+        config.ModelConfig.Tokens = Path.Combine(directory, name + "-tokens.txt");
+        config.ModelConfig.NumThreads = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 1));
+        config.ModelConfig.Provider = "cpu";
         config.ModelConfig.Debug = 0;
         config.DecodingMethod = "greedy_search";
-        recognizer = new OfflineRecognizer(config);
-
-        var vadConfig = new VadModelConfig();
-        var sileroConfig = vadConfig.SileroVad;
-        sileroConfig.Model = silero;
-        vadConfig.SileroVad = sileroConfig;
-        vadConfig.SampleRate = SampleRate;
-        vadConfig.NumThreads = 1;
-        vadConfig.Debug = 0;
-        vad = new VoiceActivityDetector(vadConfig, 30.0f);
-        ResetRecognitionSession();
+        config.MaxActivePaths = 4;
+        return config;
     }
 
-    public void Start()
+    public static VadModelConfig CreateVadConfig(string modelDirectory, bool refinement)
     {
-        ThrowIfDisposed();
-        if (WaveInEvent.DeviceCount < 1)
-            throw new InvalidOperationException("No microphone input device was found.");
-        StartWorker(true);
+        var config = new VadModelConfig();
+        config.SileroVad.Model = Path.Combine(modelDirectory, "silero_vad.onnx");
+        config.SileroVad.Threshold = 0.5f;
+        config.SileroVad.MinSilenceDuration = 0.5f;
+        config.SileroVad.MinSpeechDuration = 0.25f;
+        config.SileroVad.WindowSize = 512;
+        config.SileroVad.MaxSpeechDuration = refinement ? 25.0f : 6.0f;
+        config.SampleRate = 16000;
+        config.NumThreads = 1;
+        config.Provider = "cpu";
+        return config;
     }
 
-    public void StartTestSession()
+    public WhisperSpeechDecoder(string modelDirectory, bool refinement)
     {
-        ThrowIfDisposed();
-        StartWorker(false);
-    }
-
-    public void FeedPcm16ForTest(byte[] buffer, int bytesRecorded)
-    {
-        lock (stateLock)
+        var config = CreateConfig(modelDirectory, refinement);
+        string encoderHash = refinement
+            ? "b02dcdf54f348741e93fe732b67d933c8dcb6735655f710640143081db38878b"
+            : "4cbe7b22fa9026b843b60a68640c747de05bafb1a11b57edc0e66c232d9f33a9";
+        string decoderHash = refinement
+            ? "20accd02388482eb3a46bd615631adfdc85e1eb2c7db9ea3f02a40ffe6b81547"
+            : "acad50b5c782696e91b55914cc5ab4f756f1532f76e22aa6fc615f39fb69a8ee";
+        VerifyFile(config.ModelConfig.Whisper.Encoder, encoderHash);
+        VerifyFile(config.ModelConfig.Whisper.Decoder, decoderHash);
+        VerifyTokens(config.ModelConfig.Tokens);
+        VerifyFile(Path.Combine(modelDirectory, "silero_vad.onnx"),
+            "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6");
+        try
         {
-            if (!running || microphoneSession)
-                throw new InvalidOperationException("A test session is not running.");
+            recognizer = new OfflineRecognizer(config);
+            CheckHandle(recognizer);
+            vad = new VoiceActivityDetector(CreateVadConfig(modelDirectory, refinement), 40.0f);
+            CheckHandle(vad);
+            // Keep the initial VAD offset and pre-roll history in the same sample timeline.
+            var silence = new float[8000];
+            history.AddRange(silence);
+            vad.AcceptWaveform(silence);
         }
-        QueuePcm(buffer, bytesRecorded, true);
-    }
-
-    public void Stop()
-    {
-        WaveInEvent capture;
-        bool isMicrophone;
-        lock (stateLock)
-        {
-            if (!running) return;
-            stopRequested = true;
-            capture = waveIn;
-            isMicrophone = microphoneSession;
-        }
-
-        if (!isMicrophone)
-        {
-            CompleteAudioQueue();
-            return;
-        }
-        if (capture != null)
-        {
-            try
-            {
-                capture.StopRecording();
-            }
-            catch (Exception ex)
-            {
-                EnqueueError("Microphone stop failed: " + ex.Message);
-                ForceDisposeCapture(capture);
-                CompleteAudioQueue();
-            }
-        }
-    }
-
-    public bool WaitForStop(int timeoutMilliseconds)
-    {
-        Thread thread;
-        lock (stateLock) thread = workerThread;
-        if (thread == null) return true;
-        if (Thread.CurrentThread == thread) return false;
-        return thread.Join(timeoutMilliseconds);
-    }
-
-    public bool TryGetText(out string text)
-    {
-        return textQueue.TryDequeue(out text);
-    }
-
-    public bool TryGetError(out string error)
-    {
-        return errorQueue.TryDequeue(out error);
-    }
-
-    public static float[] ConvertPcm16(byte[] buffer, int bytesRecorded, float gainValue, out float normalizedLevel)
-    {
-        if (buffer == null) throw new ArgumentNullException("buffer");
-        if (bytesRecorded < 0 || bytesRecorded > buffer.Length || (bytesRecorded & 1) != 0)
-            throw new ArgumentOutOfRangeException("bytesRecorded", "PCM byte count must be even and inside the buffer.");
-
-        if (gainValue < 0.5f) gainValue = 0.5f;
-        if (gainValue > 4.0f) gainValue = 4.0f;
-        int count = bytesRecorded / 2;
-        var samples = new float[count];
-        double sum = 0.0;
-        for (int i = 0; i < count; i++)
-        {
-            float value = BitConverter.ToInt16(buffer, i * 2) / 32768.0f * gainValue;
-            if (value > 1.0f) value = 1.0f;
-            else if (value < -1.0f) value = -1.0f;
-            samples[i] = value;
-            sum += value * value;
-        }
-
-        double rms = count == 0 ? 0.0 : Math.Sqrt(sum / count);
-        double db = rms <= 0.000001 ? -120.0 : 20.0 * Math.Log10(rms);
-        double level = (db + 60.0) / 60.0;
-        if (level < 0.0) level = 0.0;
-        if (level > 1.0) level = 1.0;
-        normalizedLevel = (float)level;
-        return samples;
-    }
-
-    public static string EnsureModel(string modelDir)
-    {
-        if (string.IsNullOrWhiteSpace(modelDir))
-            throw new ArgumentException("Model directory is required.", "modelDir");
-        if (!Directory.Exists(modelDir))
-            throw new DirectoryNotFoundException("Model directory not found: " + modelDir);
-
-        string fullModelDir = Path.GetFullPath(modelDir);
-        string encoderPath = Path.Combine(fullModelDir, EncoderName);
-        if (IsValidEncoder(encoderPath)) return encoderPath;
-
-        string mutexName = GetModelMutexName(fullModelDir);
-        using (var mutex = new Mutex(false, mutexName))
-        {
-            bool ownsMutex = false;
-            try
-            {
-                try
-                {
-                    ownsMutex = mutex.WaitOne(TimeSpan.FromMinutes(5));
-                }
-                catch (AbandonedMutexException)
-                {
-                    ownsMutex = true;
-                }
-                if (!ownsMutex)
-                    throw new TimeoutException("Timed out while waiting to prepare the encoder model.");
-
-                if (IsValidEncoder(encoderPath)) return encoderPath;
-
-                for (int i = 0; i < EncoderParts.Length; i++)
-                {
-                    string partPath = RequireFile(fullModelDir, EncoderParts[i]);
-                    string actualHash = ComputeSha256(partPath);
-                    if (!actualHash.Equals(EncoderPartHashes[i], StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("Encoder model part checksum mismatch: " + EncoderParts[i]);
-                }
-
-                string tempPath = encoderPath + ".tmp." +
-                    System.Diagnostics.Process.GetCurrentProcess().Id + "." + Guid.NewGuid().ToString("N");
-                try
-                {
-                    using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                    {
-                        byte[] buffer = new byte[1024 * 1024];
-                        for (int i = 0; i < EncoderParts.Length; i++)
-                        {
-                            string partPath = Path.Combine(fullModelDir, EncoderParts[i]);
-                            using (var input = new FileStream(partPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                            {
-                                int read;
-                                while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
-                                    output.Write(buffer, 0, read);
-                            }
-                        }
-                    }
-
-                    var info = new FileInfo(tempPath);
-                    if (info.Length != EncoderLength)
-                        throw new InvalidDataException("Reconstructed encoder model has the wrong length.");
-                    string mergedHash = ComputeSha256(tempPath);
-                    if (!mergedHash.Equals(EncoderHash, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("Reconstructed encoder model checksum mismatch.");
-
-                    if (File.Exists(encoderPath)) File.Delete(encoderPath);
-                    File.Move(tempPath, encoderPath);
-                }
-                finally
-                {
-                    if (File.Exists(tempPath)) File.Delete(tempPath);
-                }
-                return encoderPath;
-            }
-            finally
-            {
-                if (ownsMutex) mutex.ReleaseMutex();
-            }
-        }
+        catch { Dispose(); throw; }
     }
 
     public List<string> Feed(float[] samples)
     {
-        ThrowIfDisposed();
-        var results = new List<string>();
-        if (samples == null || samples.Length == 0) return results;
-        AppendHistory(samples);
+        if (vad == null) throw new ObjectDisposedException("WhisperSpeechDecoder");
+        if (samples == null) throw new ArgumentNullException("samples");
+        history.AddRange(samples);
         vad.AcceptWaveform(samples);
-        DrainVad(results);
-        return results;
+        return Drain();
     }
 
     public List<string> Flush()
     {
-        ThrowIfDisposed();
-        var results = new List<string>();
+        if (vad == null) throw new ObjectDisposedException("WhisperSpeechDecoder");
         vad.Flush();
-        DrainVad(results);
-        return results;
+        return Drain();
     }
 
-    public static string[] DecodeFileSegments(string modelDir, string wavPath)
+    private List<string> Drain()
     {
-        float[] samples = ReadWav(wavPath);
         var results = new List<string>();
-        using (var engine = new TranscriberEngine(modelDir))
-        {
-            const int chunkSize = 512;
-            for (int offset = 0; offset < samples.Length; offset += chunkSize)
-            {
-                int count = Math.Min(chunkSize, samples.Length - offset);
-                var chunk = new float[count];
-                Array.Copy(samples, offset, chunk, 0, count);
-                results.AddRange(engine.Feed(chunk));
-            }
-            results.AddRange(engine.Flush());
-        }
-        return results.ToArray();
-    }
-
-    public void Dispose()
-    {
-        lock (stateLock)
-        {
-            if (disposed) return;
-        }
-        Stop();
-        if (!WaitForStop(30000))
-            throw new TimeoutException("Timed out while stopping the transcription worker.");
-        lock (stateLock) disposed = true;
-        if (vad != null)
-        {
-            vad.Dispose();
-            vad = null;
-        }
-        if (recognizer != null)
-        {
-            recognizer.Dispose();
-            recognizer = null;
-        }
-        captureStoppedEvent.Dispose();
-        GC.SuppressFinalize(this);
-    }
-
-    private void StartWorker(bool useMicrophone)
-    {
-        lock (stateLock)
-        {
-            if (running) throw new InvalidOperationException("Transcription is already running.");
-            microphoneSession = useMicrophone;
-            stopRequested = false;
-            latestLevel = 0.0f;
-            audioQueue = new BlockingCollection<float[]>(100);
-            running = true;
-            workerThread = new Thread(WorkerMain);
-            workerThread.IsBackground = true;
-            workerThread.Name = "toolrack-transcribe-worker";
-            workerThread.Start();
-        }
-    }
-
-    private void WorkerMain()
-    {
-        try
-        {
-            ResetRecognitionSession();
-            bool useMicrophone;
-            lock (stateLock) useMicrophone = microphoneSession;
-            if (useMicrophone) StartWaveInput();
-
-            BlockingCollection<float[]> queue;
-            lock (stateLock) queue = audioQueue;
-            foreach (float[] samples in queue.GetConsumingEnumerable())
-                EnqueueResults(Feed(samples));
-            EnqueueResults(Flush());
-        }
-        catch (Exception ex)
-        {
-            EnqueueError("Transcription failed: " + ex.Message);
-            CompleteAudioQueue();
-            StopCaptureAfterFailure();
-        }
-        finally
-        {
-            lock (stateLock)
-            {
-                latestLevel = 0.0f;
-                running = false;
-                workerThread = null;
-            }
-        }
-    }
-
-    private void StartWaveInput()
-    {
-        var capture = new WaveInEvent();
-        capture.WaveFormat = new WaveFormat(SampleRate, 16, 1);
-        capture.BufferMilliseconds = 100;
-        capture.NumberOfBuffers = 3;
-        capture.DataAvailable += OnDataAvailable;
-        capture.RecordingStopped += OnRecordingStopped;
-        captureStoppedEvent.Reset();
-        lock (stateLock) waveIn = capture;
-
-        try
-        {
-            capture.StartRecording();
-        }
-        catch
-        {
-            capture.DataAvailable -= OnDataAvailable;
-            capture.RecordingStopped -= OnRecordingStopped;
-            lock (stateLock)
-            {
-                if (Object.ReferenceEquals(waveIn, capture)) waveIn = null;
-            }
-            capture.Dispose();
-            captureStoppedEvent.Set();
-            throw;
-        }
-
-        bool stopNow;
-        lock (stateLock) stopNow = stopRequested;
-        if (stopNow) capture.StopRecording();
-    }
-
-    private void OnDataAvailable(object sender, WaveInEventArgs e)
-    {
-        try
-        {
-            QueuePcm(e.Buffer, e.BytesRecorded, false);
-        }
-        catch (Exception ex)
-        {
-            EnqueueError("Microphone input failed: " + ex.Message);
-            Stop();
-        }
-    }
-
-    private void OnRecordingStopped(object sender, StoppedEventArgs e)
-    {
-        var capture = (WaveInEvent)sender;
-        if (e.Exception != null)
-            EnqueueError("Microphone recording stopped: " + e.Exception.Message);
-        ForceDisposeCapture(capture);
-        captureStoppedEvent.Set();
-        CompleteAudioQueue();
-    }
-
-    private void QueuePcm(byte[] buffer, int bytesRecorded, bool throwOnFull)
-    {
-        float gainValue;
-        BlockingCollection<float[]> queue;
-        lock (stateLock)
-        {
-            gainValue = gain;
-            queue = audioQueue;
-        }
-        float level;
-        float[] samples = ConvertPcm16(buffer, bytesRecorded, gainValue, out level);
-        lock (stateLock) latestLevel = level;
-
-        bool added = false;
-        if (queue != null && !queue.IsAddingCompleted)
-        {
-            try
-            {
-                added = queue.TryAdd(samples);
-            }
-            catch (InvalidOperationException)
-            {
-                added = false;
-            }
-        }
-        if (!added)
-        {
-            if (throwOnFull) throw new InvalidOperationException("The audio queue is not accepting samples.");
-            EnqueueError("Audio processing fell behind; recording was stopped to avoid missing audio.");
-            Stop();
-        }
-    }
-
-    private void CompleteAudioQueue()
-    {
-        BlockingCollection<float[]> queue;
-        lock (stateLock) queue = audioQueue;
-        if (queue == null || queue.IsAddingCompleted) return;
-        try
-        {
-            queue.CompleteAdding();
-        }
-        catch (InvalidOperationException)
-        {
-        }
-    }
-
-    private void StopCaptureAfterFailure()
-    {
-        WaveInEvent capture;
-        lock (stateLock) capture = waveIn;
-        if (capture == null) return;
-        try
-        {
-            capture.StopRecording();
-            if (!captureStoppedEvent.WaitOne(5000))
-                EnqueueError("Microphone did not stop within five seconds.");
-        }
-        catch (Exception ex)
-        {
-            EnqueueError("Microphone cleanup failed: " + ex.Message);
-            ForceDisposeCapture(capture);
-            captureStoppedEvent.Set();
-        }
-    }
-
-    private void ForceDisposeCapture(WaveInEvent capture)
-    {
-        capture.DataAvailable -= OnDataAvailable;
-        capture.RecordingStopped -= OnRecordingStopped;
-        lock (stateLock)
-        {
-            if (Object.ReferenceEquals(waveIn, capture)) waveIn = null;
-        }
-        try
-        {
-            capture.Dispose();
-        }
-        catch (Exception ex)
-        {
-            EnqueueError("Microphone cleanup failed: " + ex.Message);
-        }
-    }
-
-    private void EnqueueResults(List<string> results)
-    {
-        for (int i = 0; i < results.Count; i++) textQueue.Enqueue(results[i]);
-    }
-
-    private void EnqueueError(string message)
-    {
-        if (!string.IsNullOrWhiteSpace(message)) errorQueue.Enqueue(message);
-    }
-
-    private void ResetRecognitionSession()
-    {
-        vad.Reset();
-        sampleHistory.Clear();
-        historyStart = 0;
-        var initialSilence = new float[SampleRate / 2];
-        AppendHistory(initialSilence);
-        vad.AcceptWaveform(initialSilence);
-    }
-
-    private void DrainVad(List<string> results)
-    {
         while (!vad.IsEmpty())
         {
             var segment = vad.Front();
             try
             {
-                string text = Decode(AddPreRoll(segment));
-                if (!string.IsNullOrWhiteSpace(text)) results.Add(text);
+                int start = Math.Max(historyStart, segment.Start - 4000);
+                int preCount = Math.Max(0, segment.Start - start);
+                int index = start - historyStart;
+                if (index < 0 || index + preCount > history.Count) preCount = 0;
+                var audio = new float[preCount + segment.Samples.Length];
+                if (preCount > 0) history.CopyTo(index, audio, 0, preCount);
+                Array.Copy(segment.Samples, 0, audio, preCount, segment.Samples.Length);
+                using (var stream = recognizer.CreateStream())
+                {
+                    CheckHandle(stream);
+                    stream.AcceptWaveform(16000, audio);
+                    recognizer.Decode(stream);
+                    string text = stream.Result.Text;
+                    if (!string.IsNullOrWhiteSpace(text)) results.Add(text.Trim());
+                }
+            }
+            finally { vad.Pop(); }
+        }
+        if (history.Count > 16000 * 40)
+        {
+            int remove = history.Count - 16000 * 35;
+            history.RemoveRange(0, remove);
+            historyStart += remove;
+        }
+        return results;
+    }
+
+    public void Dispose()
+    {
+        try { if (vad != null) vad.Dispose(); }
+        finally
+        {
+            vad = null;
+            if (recognizer != null) { recognizer.Dispose(); recognizer = null; }
+        }
+    }
+
+    // The bundled 1.13.4 managed wrapper does not throw for a null native handle.
+    // Check before the first native call rather than risking an access violation.
+    private static void CheckHandle(object instance)
+    {
+        var field = instance.GetType().GetField("_handle", BindingFlags.Instance | BindingFlags.NonPublic);
+        if (field == null) throw new InvalidOperationException("Unsupported sherpa-onnx wrapper; restore the bundled DLLs.");
+        object value = field.GetValue(instance);
+        IntPtr handle = value is HandleRef ? ((HandleRef)value).Handle : (IntPtr)value;
+        if (handle == IntPtr.Zero)
+            throw new InvalidOperationException("Native speech engine initialization failed. Check models, DLLs and available memory.");
+    }
+
+    public static void VerifyFile(string path, string expectedHash)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException("Model file missing. Run setup-models.cmd before recording/refining: " + path, path);
+        using (var input = File.OpenRead(path))
+        using (var sha = SHA256.Create())
+        {
+            string hash = BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "");
+            if (!hash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Model checksum mismatch. Run setup-models.cmd to repair: " + path);
+        }
+    }
+
+    public static void VerifyTokens(string path)
+    {
+        if (!File.Exists(path)) throw new FileNotFoundException("Token file missing. Run setup-models.cmd: " + path, path);
+        int expectedId = 0;
+        foreach (string line in File.ReadLines(path))
+        {
+            int split = line.LastIndexOf(' ');
+            int id;
+            if (split <= 0 || !int.TryParse(line.Substring(split + 1), out id) || id != expectedId++)
+                throw new InvalidDataException("Invalid Whisper token table: " + path);
+            try { Convert.FromBase64String(line.Substring(0, split)); }
+            catch (FormatException) { throw new InvalidDataException("Invalid Whisper token encoding: " + path); }
+        }
+        if (expectedId != 50257) throw new InvalidDataException("Unexpected Whisper token count: " + path);
+    }
+}
+
+// Disk-backed audio queue. Inference never runs in the microphone callback and cannot
+// overflow a bounded in-memory queue. The header is refreshed after every write.
+public sealed class PcmSpool : IDisposable
+{
+    private readonly object gate = new object();
+    private FileStream writer;
+    private FileStream reader;
+    private readonly AutoResetEvent available = new AutoResetEvent(false);
+    private long length;
+    private bool complete;
+    private bool disposed;
+    public string FilePath { get; private set; }
+    public long DataLength { get { lock (gate) return length; } }
+    public bool IsComplete { get { lock (gate) return complete; } }
+
+    public PcmSpool(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        FilePath = Path.Combine(directory, "recording_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + "_" + Guid.NewGuid().ToString("N") + ".wav");
+        try
+        {
+            writer = new FileStream(FilePath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read);
+            using (var header = new MemoryStream())
+            using (var binary = new BinaryWriter(header))
+            {
+                binary.Write(Encoding.ASCII.GetBytes("RIFF")); binary.Write(36);
+                binary.Write(Encoding.ASCII.GetBytes("WAVEfmt ")); binary.Write(16);
+                binary.Write((short)1); binary.Write((short)1); binary.Write(16000);
+                binary.Write(32000); binary.Write((short)2); binary.Write((short)16);
+                binary.Write(Encoding.ASCII.GetBytes("data")); binary.Write(0);
+                writer.Write(header.ToArray(), 0, 44);
+            }
+            writer.Flush();
+            reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            reader.Position = 44;
+        }
+        catch { if (writer != null) writer.Dispose(); available.Dispose(); throw; }
+    }
+
+    public bool Append(byte[] pcm, int count, float gain, out float level)
+    {
+        float[] samples = TranscriberEngine.ConvertPcm16(pcm, count, gain, out level);
+        var bytes = new byte[samples.Length * 2];
+        for (int i = 0; i < samples.Length; i++)
+        {
+            int value = Math.Max(-32768, Math.Min(32767, (int)Math.Round(samples[i] * 32768.0)));
+            bytes[2 * i] = (byte)value; bytes[2 * i + 1] = (byte)(value >> 8);
+        }
+        lock (gate)
+        {
+            if (complete) return false;
+            // Bound RIFF sizes and the VAD's signed 32-bit sample offset to 24 hours.
+            if (length + bytes.Length > 16000L * 2 * 60 * 60 * 24)
+                throw new IOException("The 24-hour recording limit was reached. Start a new recording.");
+            writer.Position = 44 + length;
+            writer.Write(bytes, 0, bytes.Length);
+            length += bytes.Length;
+            UpdateHeader();
+            available.Set();
+            return true;
+        }
+    }
+
+    private void UpdateHeader()
+    {
+        writer.Position = 4;
+        byte[] size = BitConverter.GetBytes((uint)(36 + length)); writer.Write(size, 0, 4);
+        writer.Position = 40;
+        size = BitConverter.GetBytes((uint)length); writer.Write(size, 0, 4);
+        writer.Flush();
+    }
+
+    public float[] ReadSamples()
+    {
+        lock (gate)
+        {
+            if (disposed) throw new ObjectDisposedException("PcmSpool");
+            int count = (int)Math.Min(1024, 44 + length - reader.Position);
+            if (count <= 0) return new float[0];
+            var buffer = new byte[count];
+            int read = 0;
+            while (read < count)
+            {
+                int n = reader.Read(buffer, read, count - read);
+                if (n == 0) throw new EndOfStreamException("Recorded audio was truncated.");
+                read += n;
+            }
+            float ignored;
+            return TranscriberEngine.ConvertPcm16(buffer, count, 1.0f, out ignored);
+        }
+    }
+
+    public void WaitForData() { available.WaitOne(50); }
+    public void Complete()
+    {
+        lock (gate)
+        {
+            if (complete) return;
+            complete = true;
+            try { UpdateHeader(); }
+            finally { writer.Dispose(); writer = null; available.Set(); }
+        }
+    }
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            try { Complete(); }
+            finally { reader.Dispose(); available.Dispose(); disposed = true; }
+        }
+    }
+}
+
+public sealed class TranscriberEngine : IDisposable
+{
+    private readonly object gate = new object();
+    private readonly Func<bool, ISpeechDecoder> decoderFactory;
+    private readonly string recordingDirectory;
+    private readonly ConcurrentQueue<string> texts = new ConcurrentQueue<string>();
+    private readonly ConcurrentQueue<string> refined = new ConcurrentQueue<string>();
+    private readonly ConcurrentQueue<string> errors = new ConcurrentQueue<string>();
+    private Thread worker;
+    private WaveInEvent capture;
+    private PcmSpool activeSpool;
+    private bool testSession;
+    private volatile bool stopRequested;
+    private volatile bool cancelRequested;
+    private long stopTicks;
+    private bool disposed;
+    private int failed;
+    private string state = "Idle";
+    private string lastRecording = "";
+    private string currentRecording = "";
+    private float gain = 1.0f;
+    private float latestLevel;
+    private double progress;
+    private double backlogSeconds;
+    private int sessionVersion;
+
+    public TranscriberEngine(string modelDirectory, string outputDirectory)
+        : this(outputDirectory, delegate(bool final) { return new WhisperSpeechDecoder(modelDirectory, final); }) { }
+
+    public TranscriberEngine(string outputDirectory, Func<bool, ISpeechDecoder> factory)
+    {
+        if (string.IsNullOrWhiteSpace(outputDirectory)) throw new ArgumentException("Output directory is required.");
+        if (factory == null) throw new ArgumentNullException("factory");
+        recordingDirectory = Path.GetFullPath(outputDirectory);
+        decoderFactory = factory;
+    }
+
+    public bool IsBusy { get { lock (gate) return worker != null && worker.IsAlive; } }
+    public bool IsRunning { get { return IsBusy; } }
+    public bool IsCancellationRequested { get { return cancelRequested; } }
+    public string State { get { lock (gate) return state; } }
+    public float LatestLevel { get { lock (gate) return latestLevel; } }
+    public double Progress { get { lock (gate) return progress; } }
+    public double BacklogSeconds { get { lock (gate) return backlogSeconds; } }
+    public string LastRecordingPath { get { lock (gate) return lastRecording; } }
+    public string CurrentRecordingPath { get { lock (gate) return currentRecording; } }
+    public int SessionVersion { get { lock (gate) return sessionVersion; } }
+    public bool HasRecording { get { return File.Exists(LastRecordingPath); } }
+    public float Gain
+    {
+        get { lock (gate) return gain; }
+        set
+        {
+            if (float.IsNaN(value) || float.IsInfinity(value)) throw new ArgumentOutOfRangeException("value");
+            lock (gate) gain = Math.Max(0.5f, Math.Min(4.0f, value));
+        }
+    }
+
+    public void Start() { StartRecordingJob(false); }
+    public void StartTestSession() { StartRecordingJob(true); }
+    private void StartRecordingJob(bool test)
+    {
+        StartJob("LoadingSmall", delegate { Record(test); });
+    }
+    public void StartRefinement()
+    {
+        string path = LastRecordingPath;
+        if (!File.Exists(path)) throw new InvalidOperationException("No completed recording is available.");
+        StartJob("LoadingTurbo", delegate { Refine(path); });
+    }
+    private void StartJob(string initialState, ThreadStart action)
+    {
+        lock (gate)
+        {
+            if (disposed) throw new ObjectDisposedException("TranscriberEngine");
+            if (worker != null && worker.IsAlive) throw new InvalidOperationException("An operation is already running.");
+            stopRequested = false; cancelRequested = false; stopTicks = 0; failed = 0;
+            progress = 0; backlogSeconds = 0; state = initialState;
+            worker = new Thread(delegate()
+            {
+                try { action(); }
+                catch (Exception ex) { ReportError(ex); }
+                finally { lock (gate) { latestLevel = 0; state = failed != 0 ? "Error" : "Idle"; } }
+            });
+            worker.IsBackground = true;
+            worker.Name = "pub-transcribe-worker";
+            worker.Start();
+        }
+    }
+
+    public void FeedPcm16ForTest(byte[] buffer, int count)
+    {
+        PcmSpool spool;
+        lock (gate)
+        {
+            if (!testSession || activeSpool == null || state != "Recording")
+                throw new InvalidOperationException("A test recording is not ready.");
+            spool = activeSpool;
+        }
+        float level;
+        if (!spool.Append(buffer, count, Gain, out level)) throw new InvalidOperationException("Recording has stopped.");
+    }
+
+    public void Stop()
+    {
+        WaveInEvent input; PcmSpool spool;
+        lock (gate)
+        {
+            if (!stopRequested) Interlocked.Exchange(ref stopTicks, DateTime.UtcNow.Ticks);
+            stopRequested = true;
+            input = capture; spool = activeSpool;
+            if (state == "Recording" || state == "LoadingSmall") state = "Stopping";
+        }
+        try
+        {
+            if (input != null) input.StopRecording();
+            else if (spool != null) spool.Complete();
+        }
+        catch (Exception ex)
+        {
+            ReportError(ex);
+            try { if (spool != null) spool.Complete(); }
+            catch (Exception cleanupError) { ReportError(cleanupError); }
+        }
+    }
+    public void Cancel()
+    {
+        cancelRequested = true;
+        Stop();
+    }
+    public bool WaitForStop(int milliseconds)
+    {
+        Thread thread; lock (gate) thread = worker;
+        return thread == null || (Thread.CurrentThread != thread && thread.Join(milliseconds));
+    }
+    public bool TryGetText(out string text) { return texts.TryDequeue(out text); }
+    public bool TryGetRefinedText(out string text) { return refined.TryDequeue(out text); }
+    public bool TryGetError(out string error) { return errors.TryDequeue(out error); }
+
+    private void Record(bool test)
+    {
+        ISpeechDecoder decoder = null;
+        PcmSpool spool = null;
+        WaveInEvent input = null;
+        EventHandler<WaveInEventArgs> onData = null;
+        EventHandler<StoppedEventArgs> onStopped = null;
+        using (var stopped = new ManualResetEvent(test))
+        {
+            try
+            {
+                if (!test && WaveInEvent.DeviceCount < 1) throw new InvalidOperationException("No microphone input device was found.");
+                decoder = decoderFactory(false);
+                if (cancelRequested || stopRequested) return;
+                spool = new PcmSpool(recordingDirectory);
+                lock (gate) { activeSpool = spool; testSession = test; }
+                if (!test)
+                {
+                    input = new WaveInEvent();
+                    input.WaveFormat = new WaveFormat(16000, 16, 1);
+                    input.BufferMilliseconds = 100; input.NumberOfBuffers = 3;
+                    onData = delegate(object sender, WaveInEventArgs e)
+                    {
+                        try
+                        {
+                            float level;
+                            if (spool.Append(e.Buffer, e.BytesRecorded, Gain, out level))
+                                lock (gate) latestLevel = level;
+                        }
+                        catch (Exception ex) { ReportError(ex); Stop(); }
+                    };
+                    onStopped = delegate(object sender, StoppedEventArgs e)
+                    {
+                        try
+                        {
+                            if (e.Exception != null) ReportError(e.Exception);
+                            spool.Complete();
+                        }
+                        catch (Exception ex) { ReportError(ex); }
+                        finally { try { stopped.Set(); } catch (ObjectDisposedException) { } }
+                    };
+                    input.DataAvailable += onData; input.RecordingStopped += onStopped;
+                    lock (gate) capture = input;
+                    input.StartRecording();
+                }
+                lock (gate)
+                {
+                    currentRecording = spool.FilePath; lastRecording = ""; sessionVersion++;
+                    state = stopRequested ? "Stopping" : "Recording";
+                }
+                if (stopRequested) Stop();
+                long processed = 0;
+                while (!cancelRequested)
+                {
+                    if (stopRequested && !spool.IsComplete &&
+                        DateTime.UtcNow.Ticks - Interlocked.Read(ref stopTicks) > TimeSpan.FromSeconds(5).Ticks)
+                    {
+                        ReportError(new TimeoutException("Microphone did not signal that recording stopped."));
+                        spool.Complete();
+                    }
+                    float[] samples = spool.ReadSamples();
+                    if (samples.Length > 0)
+                    {
+                        foreach (string text in decoder.Feed(samples)) texts.Enqueue(text);
+                        processed += samples.Length;
+                        lock (gate) backlogSeconds = Math.Max(0, spool.DataLength / 32000.0 - processed / 16000.0);
+                    }
+                    else if (spool.IsComplete) break;
+                    else spool.WaitForData();
+                }
+                if (!cancelRequested) foreach (string text in decoder.Flush()) texts.Enqueue(text);
             }
             finally
             {
-                vad.Pop();
+                // Detach callbacks and release capture before exposing the completed session.
+                lock (gate) { capture = null; activeSpool = null; testSession = false; }
+                if (input != null)
+                {
+                    try
+                    {
+                        input.StopRecording();
+                        if (!stopped.WaitOne(5000)) ReportError(new TimeoutException("Microphone stop timed out."));
+                    }
+                    catch (Exception ex) { ReportError(ex); }
+                    input.DataAvailable -= onData; input.RecordingStopped -= onStopped;
+                    SafeDispose(input);
+                }
+                if (spool != null)
+                {
+                    try { spool.Complete(); }
+                    catch (Exception ex) { ReportError(ex); }
+                    if (spool.DataLength > 0) { lock (gate) lastRecording = spool.FilePath; }
+                    SafeDispose(spool);
+                }
+                SafeDispose(decoder);
+                lock (gate) { capture = null; activeSpool = null; testSession = false; }
             }
         }
-        TrimHistory();
     }
 
-    private float[] AddPreRoll(SpeechSegment segment)
+    private void Refine(string path)
     {
-        int segmentStart = segment.Start;
-        int wantedStart = Math.Max(historyStart, segmentStart - PreRollSamples);
-        int preCount = Math.Max(0, segmentStart - wantedStart);
-        int historyIndex = wantedStart - historyStart;
-        if (historyIndex < 0 || historyIndex + preCount > sampleHistory.Count)
-            preCount = 0;
-
-        float[] segmentSamples = segment.Samples;
-        var combined = new float[preCount + segmentSamples.Length];
-        if (preCount > 0) sampleHistory.CopyTo(historyIndex, combined, 0, preCount);
-        Array.Copy(segmentSamples, 0, combined, preCount, segmentSamples.Length);
-        return combined;
-    }
-
-    private void AppendHistory(float[] samples)
-    {
-        sampleHistory.AddRange(samples);
-    }
-
-    private void TrimHistory()
-    {
-        if (sampleHistory.Count <= HistoryTrimAtSamples) return;
-        int removeCount = sampleHistory.Count - HistoryKeepSamples;
-        sampleHistory.RemoveRange(0, removeCount);
-        historyStart += removeCount;
-    }
-
-    private string Decode(float[] samples)
-    {
-        var stream = recognizer.CreateStream();
-        try
+        var output = new StringBuilder();
+        using (ISpeechDecoder decoder = decoderFactory(true))
+        using (var reader = new WaveFileReader(path))
         {
-            stream.AcceptWaveform(SampleRate, samples);
-            recognizer.Decode(stream);
-            return stream.Result.Text;
-        }
-        finally
-        {
-            stream.Dispose();
-        }
-    }
-
-    private static float[] ReadWav(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-            throw new ArgumentException("WAV path is required.", "path");
-        byte[] bytes = File.ReadAllBytes(path);
-        if (bytes.Length < 12 || Encoding.ASCII.GetString(bytes, 0, 4) != "RIFF" ||
-            Encoding.ASCII.GetString(bytes, 8, 4) != "WAVE")
-            throw new InvalidDataException("WAV must be a RIFF/WAVE file.");
-
-        int formatTag = -1;
-        int channels = -1;
-        int sampleRate = -1;
-        int bitsPerSample = -1;
-        int dataOffset = -1;
-        int dataLength = -1;
-        int offset = 12;
-        while (offset + 8 <= bytes.Length)
-        {
-            string id = Encoding.ASCII.GetString(bytes, offset, 4);
-            int size = BitConverter.ToInt32(bytes, offset + 4);
-            if (size < 0 || (long)offset + 8L + size > bytes.Length)
-                throw new InvalidDataException("WAV contains an invalid chunk length.");
-            int content = offset + 8;
-            if (id == "fmt ")
+            ValidateWave(reader);
+            lock (gate) state = "Refining";
+            var bytes = new byte[1024];
+            int count;
+            while (!cancelRequested && (count = reader.Read(bytes, 0, bytes.Length)) > 0)
             {
-                if (size < 16) throw new InvalidDataException("WAV fmt chunk is too short.");
-                formatTag = BitConverter.ToInt16(bytes, content);
-                channels = BitConverter.ToInt16(bytes, content + 2);
-                sampleRate = BitConverter.ToInt32(bytes, content + 4);
-                bitsPerSample = BitConverter.ToInt16(bytes, content + 14);
+                float ignored;
+                foreach (string text in decoder.Feed(ConvertPcm16(bytes, count, 1.0f, out ignored))) output.AppendLine(text);
+                lock (gate) progress = reader.Length == 0 ? 1 : (double)reader.Position / reader.Length;
             }
-            else if (id == "data")
-            {
-                dataOffset = content;
-                dataLength = size;
-            }
-            offset = content + size + (size & 1);
+            if (cancelRequested) return;
+            foreach (string text in decoder.Flush()) output.AppendLine(text);
+            if (cancelRequested) return;
         }
+        // Commit only a complete result: failed/cancelled reruns never replace previous text.
+        if (cancelRequested) return;
+        refined.Enqueue(output.ToString());
+        lock (gate) progress = 1;
+    }
 
-        if (formatTag != 1 || channels != 1 || sampleRate != SampleRate || bitsPerSample != 16)
+    public static string[] DecodeFileSegments(string modelDirectory, string wavPath, bool refinement)
+    {
+        var output = new List<string>();
+        using (var decoder = new WhisperSpeechDecoder(modelDirectory, refinement))
+        using (var reader = new WaveFileReader(wavPath))
+        {
+            ValidateWave(reader);
+            var buffer = new byte[1024]; int count;
+            while ((count = reader.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                float ignored;
+                output.AddRange(decoder.Feed(ConvertPcm16(buffer, count, 1.0f, out ignored)));
+            }
+            output.AddRange(decoder.Flush());
+        }
+        return output.ToArray();
+    }
+    private static void ValidateWave(WaveFileReader reader)
+    {
+        var format = reader.WaveFormat;
+        if (format.Encoding != WaveFormatEncoding.Pcm || format.SampleRate != 16000 || format.Channels != 1 || format.BitsPerSample != 16 || (reader.Length & 1) != 0)
             throw new InvalidDataException("WAV must be 16 kHz mono 16-bit PCM.");
-        if (dataOffset < 0 || dataLength < 0 || (dataLength & 1) != 0)
-            throw new InvalidDataException("WAV data chunk is missing or invalid.");
-
-        var samples = new float[dataLength / 2];
+    }
+    private void ReportError(Exception error)
+    {
+        Interlocked.Exchange(ref failed, 1);
+        errors.Enqueue(error.ToString());
+    }
+    private void SafeDispose(IDisposable item)
+    {
+        if (item == null) return;
+        try { item.Dispose(); } catch (Exception ex) { ReportError(ex); }
+    }
+    public void Dispose()
+    {
+        lock (gate) { if (disposed) return; }
+        Cancel();
+        if (!WaitForStop(0)) throw new InvalidOperationException("Cancel and wait for the worker before disposing the engine.");
+        lock (gate) disposed = true;
+    }
+    public static float[] ConvertPcm16(byte[] buffer, int count, float gainValue, out float level)
+    {
+        if (buffer == null) throw new ArgumentNullException("buffer");
+        if (count < 0 || count > buffer.Length || (count & 1) != 0) throw new ArgumentOutOfRangeException("count");
+        if (float.IsNaN(gainValue) || float.IsInfinity(gainValue)) throw new ArgumentOutOfRangeException("gainValue");
+        gainValue = Math.Max(0.5f, Math.Min(4.0f, gainValue));
+        var samples = new float[count / 2]; double sum = 0;
         for (int i = 0; i < samples.Length; i++)
-            samples[i] = BitConverter.ToInt16(bytes, dataOffset + i * 2) / 32768.0f;
+        {
+            float value = (short)(buffer[i * 2] | (buffer[i * 2 + 1] << 8)) / 32768.0f * gainValue;
+            samples[i] = Math.Max(-1.0f, Math.Min(1.0f, value));
+            sum += samples[i] * samples[i];
+        }
+        double rms = samples.Length == 0 ? 0 : Math.Sqrt(sum / samples.Length);
+        double db = rms <= 0.000001 ? -120 : 20 * Math.Log10(rms);
+        level = (float)Math.Max(0, Math.Min(1, (db + 60) / 60));
         return samples;
-    }
-
-    private static string RequireFile(string directory, string name)
-    {
-        string path = Path.Combine(directory, name);
-        if (!File.Exists(path)) throw new FileNotFoundException("Required model file not found: " + name, path);
-        return path;
-    }
-
-    private static bool IsValidEncoder(string path)
-    {
-        if (!File.Exists(path)) return false;
-        var info = new FileInfo(path);
-        if (info.Length != EncoderLength) return false;
-        return ComputeSha256(path).Equals(EncoderHash, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static string ComputeSha256(string path)
-    {
-        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
-        using (var sha = SHA256.Create())
-        {
-            return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "");
-        }
-    }
-
-    private static string GetModelMutexName(string modelDir)
-    {
-        byte[] pathBytes = Encoding.UTF8.GetBytes(modelDir.ToUpperInvariant());
-        using (var sha = SHA256.Create())
-        {
-            byte[] hash = sha.ComputeHash(pathBytes);
-            string shortHash = BitConverter.ToString(hash, 0, 8).Replace("-", "");
-            return "Local\\toolrack-transcribe-model-" + shortHash;
-        }
-    }
-
-    private void ThrowIfDisposed()
-    {
-        if (disposed) throw new ObjectDisposedException("TranscriberEngine");
     }
 }

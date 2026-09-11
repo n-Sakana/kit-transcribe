@@ -1,0 +1,21 @@
+name: Windows checks
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell syntax, structure and WPF smoke
+        shell: powershell
+        run: .\test\check.ps1 -Runtime
+      - name: Engine regression tests (no microphone or Whisper downloads)
+        shell: powershell
+        run: .\test\engine.ps1
+      - name: Native DLL and Silero VAD smoke
+        shell: powershell
+        run: .\test\native-vad.ps1

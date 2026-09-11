@@ -1,10 +1,12 @@
 Option Explicit
-Dim shell, fso, root, entry, powershell, command
+Dim shell, fso, root, entry, powershell, command, sysnative
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 root = fso.GetParentFolderName(WScript.ScriptFullName)
 entry = fso.BuildPath(root, "src\app\main.ps1")
 powershell = shell.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\WindowsPowerShell\v1.0\powershell.exe"
+sysnative = shell.ExpandEnvironmentStrings("%SystemRoot%") & "\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+If fso.FileExists(sysnative) Then powershell = sysnative
 If Not fso.FileExists(entry) Then
     MsgBox "Transcribe entry was not found: " & entry, vbCritical, "Transcribe"
     WScript.Quit 1
