@@ -1,22 +1,24 @@
 # Third-party components
 
 Recognition runs locally without sending audio to an external service. Runtime
-DLLs and Silero VAD remain bundled. Whisper models are downloaded explicitly by
-`setup-models.cmd` from pinned revisions before use, and are not bundled in Git.
-The legacy ReazonSpeech files remain for provenance/rollback but are not used.
+DLLs, Silero VAD, both Whisper models and their token tables are bundled in the
+application folder. Whisper weights are stored as real binary parts in Git and
+reconstructed locally when first used. No user-side model retrieval, Git LFS or
+network access is required. Legacy ReazonSpeech files remain unused.
 
 | Component | Version/source | License |
 |---|---|---|
 | sherpa-onnx managed and native libraries | 1.13.4, https://github.com/k2-fsa/sherpa-onnx | Apache-2.0 |
 | ONNX Runtime native library | 1.27.0, bundled by sherpa-onnx | MIT |
 | NAudio | 1.10.0, https://github.com/naudio/NAudio | MIT |
-| Whisper small and large-v3-turbo | https://github.com/openai/whisper; sherpa-onnx ONNX int8 conversions listed in model/SOURCE.md | MIT |
+| Whisper small and large-v3-turbo | https://github.com/openai/whisper; pinned ONNX int8 conversions in model/SOURCE.md | MIT |
 | ReazonSpeech Japanese Zipformer model (unused legacy assets) | reazonspeech-k2-v2 / 2024-08-01 sherpa conversion | Apache-2.0 |
 | Silero VAD model | sherpa-onnx asr-models release asset | MIT |
 
-The corresponding license texts are in `licenses/`, including
-`licenses/Whisper-LICENSE.txt`. Fixed model revisions, download sources and
-Whisper model hashes are recorded in `model/SOURCE.md`.
+License texts are in `licenses/`, including `licenses/Whisper-LICENSE.txt`.
+Fixed revisions and assembled model hashes are in `model/SOURCE.md`. Part hashes
+are in the corresponding `.manifest`; all distributed part/token files are also
+covered by the repository's `SHA256SUMS.txt`.
 
 ## Existing vendored file checksums (SHA-256)
 

@@ -7,15 +7,18 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: PowerShell syntax, structure and WPF smoke
         shell: powershell
         run: .\test\check.ps1 -Runtime
-      - name: Engine regression tests (no microphone or Whisper downloads)
+      - name: Engine regression tests
         shell: powershell
         run: .\test\engine.ps1
+      - name: Offline bundle regression tests
+        shell: powershell
+        run: .\test\bundle.ps1
       - name: Token sentinel and file-handle regression tests
         shell: powershell
         run: .\test\token-validation.ps1
