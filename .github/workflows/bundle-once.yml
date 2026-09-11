@@ -1,0 +1,84 @@
+name: Bundle Whisper weights once
+on:
+  push:
+    branches: [codex/whisper-small-turbo-refinement]
+    paths: [.github/workflows/bundle-once.yml]
+permissions:
+  contents: read
+jobs:
+  bundle:
+    if: github.repository == 'n-Sakana/pub-transcribe' && github.ref == 'refs/heads/codex/whisper-small-turbo-refinement'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Acquire the already pinned and verified weights on the packaging machine only
+        shell: powershell
+        run: .\src\app\setup-models.ps1
+      - name: Check both real models before bundling
+        shell: powershell
+        run: .\test\model-runtime.ps1
+      - name: Store real binary parts and token tables, not LFS pointers
+        shell: python
+        run: |
+          import hashlib, json, pathlib, subprocess
+          root = pathlib.Path('src/app/model')
+          part_size = 75 * 1024 * 1024
+          bundles = []
+          paths = []
+          specs = [
+              ('whisper-small', 'small', '4cbe7b22fa9026b843b60a68640c747de05bafb1a11b57edc0e66c232d9f33a9', 'acad50b5c782696e91b55914cc5ab4f756f1532f76e22aa6fc615f39fb69a8ee'),
+              ('whisper-large-v3-turbo', 'turbo', 'b02dcdf54f348741e93fe732b67d933c8dcb6735655f710640143081db38878b', '20accd02388482eb3a46bd615631adfdc85e1eb2c7db9ea3f02a40ffe6b81547')
+          ]
+          for directory, name, encoder_hash, decoder_hash in specs:
+              for role, expected in [('encoder', encoder_hash), ('decoder', decoder_hash)]:
+                  source = root / directory / (name + '-' + role + '.int8.onnx')
+                  digest = hashlib.sha256()
+                  part_lines = []
+                  with source.open('rb') as stream:
+                      index = 1
+                      while data := stream.read(part_size):
+                          digest.update(data)
+                          part = source.with_name(source.name + '.part%02d' % index)
+                          part.write_bytes(data)
+                          part_lines.append('%s %d %s' % (hashlib.sha256(data).hexdigest(), len(data), part.name))
+                          paths.append(part.as_posix())
+                          index += 1
+                  if digest.hexdigest() != expected:
+                      raise RuntimeError('Unexpected weight checksum: ' + str(source))
+                  manifest = source.with_name(source.name + '.manifest')
+                  manifest.write_bytes(('%s %d %s\n' % (expected, source.stat().st_size, source.name) + '\n'.join(part_lines) + '\n').encode('ascii'))
+                  paths.append(manifest.as_posix())
+                  bundles.append({'file': str(source), 'bytes': source.stat().st_size, 'parts': len(part_lines), 'sha256': expected})
+              tokens = root / directory / (name + '-tokens.txt')
+              paths.append(tokens.as_posix())
+              print('TOKEN_SHA256', tokens.as_posix(), hashlib.sha256(tokens.read_bytes()).hexdigest())
+          subprocess.run(['git', 'add', '-f', '--'] + paths, check=True)
+          # Hash the staged Git bytes, not Windows checkout line endings.
+          tracked = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          sums = []
+          for path in sorted(p for p in tracked if p and p != 'SHA256SUMS.txt'):
+              process = subprocess.Popen(['git', 'cat-file', 'blob', ':' + path], stdout=subprocess.PIPE)
+              digest = hashlib.sha256()
+              with process.stdout:
+                  for data in iter(lambda: process.stdout.read(1024 * 1024), b''):
+                      digest.update(data)
+              if process.wait() != 0:
+                  raise RuntimeError('Could not hash staged path: ' + path)
+              sums.append(digest.hexdigest() + '  ' + path)
+          pathlib.Path('SHA256SUMS.txt').write_bytes(('\n'.join(sums) + '\n').encode('utf-8'))
+          subprocess.run(['git', 'add', 'SHA256SUMS.txt'], check=True)
+          print(json.dumps(bundles, indent=2))
+      - name: Commit the bundled files to this PR branch only
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Bundle Whisper small and large-v3-turbo as verified 75 MiB binary parts'
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle commit failed' }
+          git push origin HEAD:refs/heads/codex/whisper-small-turbo-refinement
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle push failed; no force push is allowed' }
+          Write-Output ('BUNDLE_COMMIT ' + (git rev-parse HEAD))
