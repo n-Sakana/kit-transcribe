@@ -36,6 +36,8 @@ public static class TranscribeDllSearch {
     $references = @('System.dll', 'System.Core.dll', 'System.Windows.Forms.dll',
         (Join-Path $bin 'sherpa-onnx.dll'), (Join-Path $bin 'NAudio.dll'))
     $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'engine.cs'))
+    $bundle = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'bundled-model.cs')) -replace '(?m)^using [^;]+;\r?\n', ''
+    $source = 'using System.Globalization;' + "`r`n" + $source + "`r`n" + $bundle
     if ($AdditionalSource) {
         $extra = [IO.File]::ReadAllText($AdditionalSource) -replace '(?m)^using [^;]+;\r?\n', ''
         $source = 'using System.Diagnostics;' + "`r`n" + $source + "`r`n" + $extra

@@ -17,6 +17,7 @@ public static class BundleRegressionTests
     {
         bool rejected = false;
         try { action(); }
+        catch (InvalidDataException) { rejected = true; }
         catch (IOException) { rejected = true; }
         Assert(rejected, "Invalid bundle was accepted.");
     }

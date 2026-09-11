@@ -77,7 +77,7 @@ try {
       </TabItem>
     </TabControl>
     <TextBlock x:Name="ErrorText" Grid.Row="3" Foreground="Firebrick" TextWrapping="Wrap" MaxHeight="100" Margin="0,8,0,0" Visibility="Collapsed"/>
-    <TextBlock x:Name="StatusText" Grid.Row="4" Text="準備完了。モデル未取得の場合は setup-models.cmd を実行してください。" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    <TextBlock x:Name="StatusText" Grid.Row="4" Text="準備完了。モデルは同梱済みです。初回は録音開始時にローカルで準備します。" Margin="0,8,0,0" TextWrapping="Wrap"/>
     <TextBlock Grid.Row="5" Text="音声は output/recordings にローカル保存します。清書は録音停止後に手動実行します。"
                FontSize="12" Foreground="DimGray" Margin="0,6,0,0" TextWrapping="Wrap"/>
   </Grid>
@@ -121,10 +121,10 @@ try {
                 return
             }
             switch ($state) {
-                'LoadingSmall' { $statusText.Text = 'Whisper small を検証・読み込み中（まだ録音していません）...' }
+                'LoadingSmall' { $statusText.Text = 'Whisper small の同梱モデルを準備・検証・読み込み中（まだ録音していません）...' }
                 'Recording' { $statusText.Text = '録音中 — 未処理音声: {0:N1} 秒' -f $engine.BacklogSeconds }
                 'Stopping' { $statusText.Text = '録音停止処理中 — 残りの音声を処理しています。中止しても録音は残ります。' }
-                'LoadingTurbo' { $statusText.Text = 'Whisper large-v3-turbo を検証・読み込み中...' }
+                'LoadingTurbo' { $statusText.Text = 'Whisper large-v3-turbo の同梱モデルを準備・検証・読み込み中...' }
                 'Refining' { $statusText.Text = '清書中: {0:P0}（中止は現在の音声区間の処理後に反映）' -f $engine.Progress }
                 'Error' { $statusText.Text = '処理に失敗しました。エラー欄とログを確認してください。保存済み音声は保持しています。' }
                 'Idle' {

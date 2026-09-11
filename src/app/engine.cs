@@ -70,8 +70,11 @@ public sealed class WhisperSpeechDecoder : ISpeechDecoder
         string decoderHash = refinement
             ? "20accd02388482eb3a46bd615631adfdc85e1eb2c7db9ea3f02a40ffe6b81547"
             : "acad50b5c782696e91b55914cc5ab4f756f1532f76e22aa6fc615f39fb69a8ee";
-        VerifyFile(config.ModelConfig.Whisper.Encoder, encoderHash);
-        VerifyFile(config.ModelConfig.Whisper.Decoder, decoderHash);
+        BundledModel.Ensure(config.ModelConfig.Whisper.Encoder, encoderHash);
+        BundledModel.Ensure(config.ModelConfig.Whisper.Decoder, decoderHash);
+        VerifyFile(config.ModelConfig.Tokens, refinement
+            ? "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"
+            : "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126");
         VerifyTokens(config.ModelConfig.Tokens);
         VerifyFile(Path.Combine(modelDirectory, "silero_vad.onnx"),
             "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6");
@@ -165,19 +168,19 @@ public sealed class WhisperSpeechDecoder : ISpeechDecoder
     public static void VerifyFile(string path, string expectedHash)
     {
         if (!File.Exists(path))
-            throw new FileNotFoundException("Model file missing. Run setup-models.cmd before recording/refining: " + path, path);
+            throw new FileNotFoundException("Bundled model file missing. Restore the complete application folder: " + path, path);
         using (var input = File.OpenRead(path))
         using (var sha = SHA256.Create())
         {
             string hash = BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "");
             if (!hash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("Model checksum mismatch. Run setup-models.cmd to repair: " + path);
+                throw new InvalidDataException("Bundled model checksum mismatch. Restore the complete application folder: " + path);
         }
     }
 
     public static void VerifyTokens(string path)
     {
-        if (!File.Exists(path)) throw new FileNotFoundException("Token file missing. Run setup-models.cmd: " + path, path);
+        if (!File.Exists(path)) throw new FileNotFoundException("Bundled token file missing. Restore the complete application folder: " + path, path);
         int expectedId = 0;
         using (var reader = File.OpenText(path))
         {
