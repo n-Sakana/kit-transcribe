@@ -1,0 +1,24 @@
+name: Whisper model smoke
+on:
+  pull_request:
+    paths:
+      - 'src/app/engine.cs'
+      - 'src/app/bootstrap.ps1'
+      - 'src/app/setup-models.ps1'
+      - 'test/model-runtime.ps1'
+      - '.github/workflows/model-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  models:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify pinned Whisper small and turbo assets
+        shell: powershell
+        run: .\src\app\setup-models.ps1
+      - name: Load both models and exercise native inference (no microphone)
+        shell: powershell
+        run: .\test\model-runtime.ps1

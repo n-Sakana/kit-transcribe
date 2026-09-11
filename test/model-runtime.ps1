@@ -13,6 +13,17 @@ foreach ($final in @($false, $true)) {
         try {
             [void]$decoder.Feed((New-Object 'single[]' 16000))
             [void]$decoder.Flush()
+            # Bypass VAD only in this smoke test: silence otherwise never exercises Whisper.
+            $field = $decoder.GetType().GetField('recognizer', [Reflection.BindingFlags]'Instance,NonPublic')
+            $recognizer = $field.GetValue($decoder)
+            $stream = $recognizer.CreateStream()
+            try {
+                if ($stream.Handle -eq [IntPtr]::Zero) { throw 'Whisper stream initialization returned null.' }
+                $stream.AcceptWaveform(16000, (New-Object 'single[]' 16000))
+                $recognizer.Decode($stream)
+                [void]$stream.Result.Text
+                Write-Output ('NATIVE_DECODE_OK ' + $name)
+            } finally { $stream.Dispose() }
         } finally { $decoder.Dispose() }
     }
     Write-Output ('MODEL_RUNTIME_OK ' + $name)
